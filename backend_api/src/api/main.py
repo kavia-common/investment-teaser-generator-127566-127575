@@ -1,8 +1,9 @@
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Body
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from uuid import UUID
 from typing import List, Optional
+import tempfile
 
 from .models import (
     ScrapeRequest,
@@ -15,7 +16,6 @@ from .models import (
     TeaserGenerationRequest,
     TeaserGenerationResponse,
     TeaserContent,
-    ExportResponse,
     Company,
     UploadedFile,
     Teaser,
@@ -23,6 +23,13 @@ from .models import (
 from .database import Base, engine, get_db
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from .business import (
+    scrape_company_info,
+    extract_file_text_and_preview,
+    generate_teaser_with_ai,
+    update_teaser_content_in_db,
+    export_teaser_to_pdf,
+)
 
 tags_metadata = [
     {"name": "Scraping", "description": "Endpoints for scraping company information"},
@@ -60,7 +67,6 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     """Shutdown event placeholder."""
-    # SQLAlchemy async engine has no explicit global teardown
     pass
 
 # PUBLIC_INTERFACE
@@ -85,22 +91,14 @@ async def scrape_company(req: ScrapeRequest):
     Returns:
         ScrapeResponse: Scraping status and extracted company info (if found).
     """
-    # TODO: Implement actual scraping logic here.
-    # For now, just return stub company with provided website
-    test_company = CompanyInfo(
-        name="Example Corp",
-        website=req.url,
-        industry="Software",
-        description="A sample company for demonstration purposes.",
-        headquarters="San Francisco, CA",
-        founded_year=2010,
-        email="info@example.com",
-        phone="555-123-4567",
-        employees=42,
-        revenue=5000000.0,
-        logo_url="https://logo.clearbit.com/example.com"
-    )
-    return ScrapeResponse(company=test_company, found=True)
+    company_dict, found = await scrape_company_info(req.url)
+    if not found or not company_dict.get("name"):
+        raise HTTPException(status_code=400, detail="Website could not be scraped or no company information found.")
+    try:
+        company = CompanyInfo(**company_dict)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Scraping returned malformed data.")
+    return ScrapeResponse(company=company, found=True)
 
 # PUBLIC_INTERFACE
 @app.post(
@@ -115,11 +113,12 @@ async def scrape_company(req: ScrapeRequest):
 )
 async def upload_files(
     files: List[UploadFile] = File(..., description="One or more files to upload (PDF, DOCX, TXT, XLSX)."),
-    company_id: Optional[UUID] = None,  # Optionally support associating with company
+    company_id: Optional[UUID] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """
     Accept file uploads (PDF, DOCX, TXT, XLSX). Parses basic details and returns a list of the uploaded files.
+    Attempts meaningful preview/summary of uploaded content.
 
     Args:
         files (List[UploadFile]): Uploaded files as multipart/form-data.
@@ -129,29 +128,28 @@ async def upload_files(
     """
     file_infos = []
 
-    for file in files:
-        content = await file.read(800)
-        preview_text = None
+    for upload_file in files:
         try:
-            preview_text = content.decode("utf-8", errors="ignore")[:200]
+            upload_file.file.seek(0)
+            _, preview = await extract_file_text_and_preview(upload_file)
         except Exception:
-            preview_text = None
-
-        # Save metadata to DB
-        uploaded_file = UploadedFile(
+            preview = None
+        upload_file.file.seek(0)
+        content = await upload_file.read()
+        uploaded_db_file = UploadedFile(
             company_id=company_id,
-            filename=file.filename,
-            content_type=file.content_type or "application/octet-stream",
+            filename=upload_file.filename,
+            content_type=upload_file.content_type or "application/octet-stream",
             size=len(content),
-            preview_text=preview_text
+            preview_text=preview
         )
-        db.add(uploaded_file)
+        db.add(uploaded_db_file)
         file_infos.append(
             UploadedFileInfo(
-                filename=file.filename,
-                content_type=file.content_type,
+                filename=upload_file.filename,
+                content_type=upload_file.content_type,
                 size=len(content),
-                preview_text=preview_text
+                preview_text=preview
             )
         )
     await db.commit()
@@ -175,14 +173,7 @@ async def confirm_company(
     """
     Accepts edited/confirmed company profile from the user.
     Begins a teaser generation workflow, returning a session ID.
-
-    Args:
-        req (ConfirmCompanyRequest): Validated company info.
-
-    Returns:
-        ConfirmCompanyResponse: Contains a session identifier.
     """
-    # Persist company to DB
     company_obj = Company(
         name=req.company.name,
         website=req.company.website,
@@ -199,7 +190,6 @@ async def confirm_company(
     db.add(company_obj)
     await db.commit()
     await db.refresh(company_obj)
-    # Use database UUID as session_id
     return ConfirmCompanyResponse(session_id=company_obj.id)
 
 # PUBLIC_INTERFACE
@@ -219,32 +209,61 @@ async def generate_teaser(
 ):
     """
     Generates an investment teaser draft based on confirmed company info and uploaded files.
-    Uses AI models (stub for now).
+    Uses AI models (Claude or Gemini).
 
     Args:
-        req (TeaserGenerationRequest): Session and input selection.
+        req (TeaserGenerationRequest): Session and file selection.
 
     Returns:
         TeaserGenerationResponse: The generated teaser draft/progress status.
     """
-    # Find company by session_id (company_id)
+    # Fetch company from session_id
     result = await db.execute(select(Company).where(Company.id == req.session_id))
     company_obj = result.scalar_one_or_none()
     if not company_obj:
-        raise HTTPException(status_code=400, detail="Invalid session or missing company.")
+        raise HTTPException(status_code=400, detail="Invalid session or company.")
 
-    # Generate teaser draft (stub AI integration for now)
-    title = f"Investment Teaser for {company_obj.name}"
-    content = (
-        f"Introducing {company_obj.name}! "
-        f"{company_obj.description or 'A dynamic company.'}"
-    )
+    # Gather latest uploaded file previews associated with company
+    file_previews = []
+    files_q = await db.execute(select(UploadedFile).where(UploadedFile.company_id == req.session_id))
+    files = files_q.scalars().all()
+    for f in files:
+        # If user selects specific files, use filter
+        if req.selected_files and f.filename not in req.selected_files:
+            continue
+        if f.preview_text:
+            file_previews.append(f.preview_text)
 
-    # Insert Teaser record
+    company_dict = {
+        "name": company_obj.name,
+        "website": company_obj.website,
+        "industry": company_obj.industry,
+        "description": company_obj.description,
+        "headquarters": company_obj.headquarters,
+        "founded_year": company_obj.founded_year,
+        "email": company_obj.email,
+        "phone": company_obj.phone,
+        "employees": company_obj.employees,
+        "revenue": company_obj.revenue,
+        "logo_url": company_obj.logo_url,
+    }
+
+    # AI Integration: "claude" by default, else "gemini"
+    ai_choice = "claude"
+    try:
+        title, teaser_text = await generate_teaser_with_ai(company_dict, file_previews, ai_choice=ai_choice)
+    except HTTPException as ai_ex:
+        raise ai_ex
+    except Exception:
+        # Soft fallback to generic stub if AI fails
+        title = f"Investment Teaser for {company_obj.name}"
+        teaser_text = f"Introducing {company_obj.name}! {company_obj.description or 'A dynamic company.'}"
+
+    # Insert/replace teaser record for this company/session
     teaser_obj = Teaser(
         company_id=company_obj.id,
         title=title,
-        content=content,
+        content=teaser_text,
     )
     db.add(teaser_obj)
     await db.commit()
@@ -264,7 +283,6 @@ async def generate_teaser(
         logo_url=company_obj.logo_url,
     )
 
-    # Compose API response model
     teaser = TeaserContent(
         teaser_id=teaser_obj.id,
         title=teaser_obj.title,
@@ -273,6 +291,43 @@ async def generate_teaser(
         generated_at=str(teaser_obj.generated_at),
     )
     return TeaserGenerationResponse(teaser=teaser, status="success")
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/api/teaser/{teaser_id}/update",
+    response_model=TeaserGenerationResponse,
+    summary="Edit or update generated teaser content",
+    tags=["Teaser"],
+    responses={
+        200: {"description": "Teaser updated and returned."},
+        404: {"description": "Teaser not found."},
+        422: {"description": "Validation error."},
+    }
+)
+async def update_teaser(
+    teaser_id: UUID,
+    updated: TeaserContent = Body(..., description="Updated teaser content and title"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Edit or update teaser headline/content on the server (after user preview or manual edit).
+    """
+    result = await db.execute(select(Teaser).where(Teaser.id == teaser_id))
+    teaser_obj = result.scalar_one_or_none()
+    if not teaser_obj:
+        raise HTTPException(status_code=404, detail="Teaser not found.")
+
+    update_teaser_content_in_db(teaser_obj, updated.title, updated.content, db)
+    await db.commit()
+    await db.refresh(teaser_obj)
+
+    # Return updated teaser model
+    return TeaserGenerationResponse(
+        teaser=updated,
+        status="success"
+    )
+
 
 # PUBLIC_INTERFACE
 @app.get(
@@ -298,17 +353,43 @@ async def export_teaser(
     Returns:
         FileResponse: Downloadable teaser file.
     """
-    # Find the teaser in the DB
     result = await db.execute(select(Teaser).where(Teaser.id == teaser_id))
     teaser_obj = result.scalar_one_or_none()
     if not teaser_obj:
         raise HTTPException(status_code=404, detail="Teaser not found.")
 
-    # For now, send metadata response; PDF generation/export will be handled later
-    resp_doc = ExportResponse(
-        teaser_id=teaser_id,
-        filename=f"investment_teaser_{teaser_id}.pdf",
-        export_type="pdf",
-        download_url=f"/api/export/{teaser_id}"
+    # Export associated company info
+    company_obj = teaser_obj.company if teaser_obj.company else None
+    company_dict = {
+        "name": teaser_obj.company.name if company_obj else "",
+        "website": teaser_obj.company.website if company_obj else "",
+        "industry": teaser_obj.company.industry if company_obj else "",
+        "description": teaser_obj.company.description if company_obj else "",
+        "headquarters": teaser_obj.company.headquarters if company_obj else "",
+        "founded_year": teaser_obj.company.founded_year if company_obj else None,
+        "email": teaser_obj.company.email if company_obj else "",
+        "phone": teaser_obj.company.phone if company_obj else "",
+        "employees": teaser_obj.company.employees if company_obj else None,
+        "revenue": teaser_obj.company.revenue if company_obj else None,
+        "logo_url": teaser_obj.company.logo_url if company_obj else "",
+    }
+    # Generate PDF to a temp file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpf:
+        export_teaser_to_pdf(
+            title=teaser_obj.title,
+            content=teaser_obj.content,
+            company=company_dict,
+            output_path=tmpf.name,
+        )
+        tmpf.flush()
+        tmpf.seek(0)
+        pdf_path = tmpf.name
+
+    filename = f"investment_teaser_{teaser_id}.pdf"
+    headers = {"Content-Disposition": f"attachment; filename={filename}"}
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename=filename,
+        headers=headers
     )
-    return JSONResponse(status_code=200, content=resp_doc.model_dump())

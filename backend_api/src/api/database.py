@@ -8,12 +8,23 @@ load_dotenv()
 
 # PUBLIC_INTERFACE
 def get_postgres_url():
-    """Get the async PostgreSQL database URL from environment variables."""
-    user = os.environ.get("POSTGRES_USER")
-    password = os.environ.get("POSTGRES_PASSWORD")
+    """Get the async PostgreSQL database URL from environment variables, with validation.
+
+    Raises ValueError if required env vars are missing or blank.
+    """
+    required_vars = ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]
+    missing = [v for v in required_vars if not os.environ.get(v)]
+    if missing:
+        raise ValueError(
+            f"Missing required database environment variables: {', '.join(missing)}. "
+            "Please set them in your container environment or .env file. "
+            "Example: POSTGRES_USER=... POSTGRES_PASSWORD=... POSTGRES_DB=..."
+        )
+    user = os.environ["POSTGRES_USER"]
+    password = os.environ["POSTGRES_PASSWORD"]
     host = os.environ.get("POSTGRES_HOST", "localhost")
     port = os.environ.get("POSTGRES_PORT", "5432")
-    db = os.environ.get("POSTGRES_DB")
+    db = os.environ["POSTGRES_DB"]
     return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{db}"
 
 DATABASE_URL = get_postgres_url()

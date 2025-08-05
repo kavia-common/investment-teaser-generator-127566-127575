@@ -173,6 +173,7 @@ async def confirm_company(
     """
     Accepts edited/confirmed company profile from the user.
     Begins a teaser generation workflow, returning a session ID.
+    Sets company step status = "confirmed" to enable step-wise tracking.
     """
     company_obj = Company(
         name=req.company.name,
@@ -186,6 +187,7 @@ async def confirm_company(
         employees=req.company.employees,
         revenue=req.company.revenue,
         logo_url=req.company.logo_url,
+        step_status="confirmed",
     )
     db.add(company_obj)
     await db.commit()
@@ -264,10 +266,15 @@ async def generate_teaser(
         company_id=company_obj.id,
         title=title,
         content=teaser_text,
+        step_status="draft"
     )
     db.add(teaser_obj)
+    # Update company workflow to reflect teaser generated
+    company_obj.step_status = "teaser_generated"
+    db.add(company_obj)
     await db.commit()
     await db.refresh(teaser_obj)
+    await db.refresh(company_obj)
 
     company_data = CompanyInfo(
         name=company_obj.name,
@@ -319,6 +326,13 @@ async def update_teaser(
         raise HTTPException(status_code=404, detail="Teaser not found.")
 
     update_teaser_content_in_db(teaser_obj, updated.title, updated.content, db)
+    # Update teaser and company progress status to reflect editing step
+    if hasattr(teaser_obj, 'step_status'):
+        teaser_obj.step_status = "editing"
+    # also update company
+    if teaser_obj.company and hasattr(teaser_obj.company, 'step_status'):
+        teaser_obj.company.step_status = "teaser_editing"
+        db.add(teaser_obj.company)
     await db.commit()
     await db.refresh(teaser_obj)
 
@@ -373,6 +387,16 @@ async def export_teaser(
         "revenue": teaser_obj.company.revenue if company_obj else None,
         "logo_url": teaser_obj.company.logo_url if company_obj else "",
     }
+    # Before returning, update workflow to mark exported
+    if hasattr(teaser_obj, 'step_status'):
+        teaser_obj.step_status = "exported"
+    if teaser_obj.company and hasattr(teaser_obj.company, 'step_status'):
+        teaser_obj.company.step_status = "exported"
+        db.add(teaser_obj.company)
+    db.add(teaser_obj)
+    await db.commit()
+    await db.refresh(teaser_obj)
+
     # Generate PDF to a temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpf:
         export_teaser_to_pdf(

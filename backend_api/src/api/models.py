@@ -12,7 +12,7 @@ from .database import Base
 # SQLAlchemy ORM MODELS
 
 class Company(Base):
-    """SQLAlchemy ORM model for company details."""
+    """SQLAlchemy ORM model for company details, including step status tracking."""
     __tablename__ = "companies"
 
     id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -27,6 +27,11 @@ class Company(Base):
     employees = Column(Integer, nullable=True)
     revenue = Column(Float, nullable=True)
     logo_url = Column(String, nullable=True)
+
+    # Progress and workflow tracking fields
+    step_status = Column(String, default="start", nullable=False, doc="Current progress step (start, scraped, confirmed, files_uploaded, teaser_generated, edited, exported)")
+    # Optionally: last_visited_step, completed_steps, etc. for more granular navigation
+    last_updated = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     # Relationships
     uploaded_files = relationship("UploadedFile", back_populates="company", cascade="all,delete")
@@ -47,7 +52,7 @@ class UploadedFile(Base):
     company = relationship("Company", back_populates="uploaded_files")
 
 class Teaser(Base):
-    """SQLAlchemy ORM model for generated teasers."""
+    """SQLAlchemy ORM model for generated teasers with progress/status tracking."""
     __tablename__ = "teasers"
 
     id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -56,12 +61,17 @@ class Teaser(Base):
     content = Column(Text, nullable=False)
     generated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
+    # Teaser-specific workflow/progress step (e.g. draft, editing, finalized, exported)
+    step_status = Column(String, default="draft", nullable=False, doc="Teaser workflow status (draft, editing, finalized, exported)")
+    last_updated = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
     company = relationship("Company", back_populates="teasers")
 
 
 # PUBLIC_INTERFACE
 class CompanyInfo(BaseModel):
-    """Company information model, includes basic identification, description, and financial fields."""
+    """Company information model, includes basic identification, description, and financial fields.
+    Also exposes workflow/progress tracking for step-wise UI navigation."""
     name: str = Field(..., description="The name of the company.")
     website: Optional[str] = Field(None, description="Official website URL of the company.")
     industry: Optional[str] = Field(None, description="Industry sector (optional, can be detected by scraping).")
@@ -73,6 +83,10 @@ class CompanyInfo(BaseModel):
     employees: Optional[int] = Field(None, description="Number of employees (if available).")
     revenue: Optional[float] = Field(None, description="Known or estimated company revenue (optional).")
     logo_url: Optional[str] = Field(None, description="URL to the company's logo image.")
+
+    # Progress tracking fields (optional for non-progress-aware API callers)
+    step_status: Optional[str] = Field(None, description="Current company workflow step (start, scraped, confirmed, uploaded, teaser_generated, exported).")
+    last_updated: Optional[str] = Field(None, description="Timestamp for last step progression (ISO8601).")
 
 # PUBLIC_INTERFACE
 class ScrapeRequest(BaseModel):

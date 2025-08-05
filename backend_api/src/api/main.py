@@ -1,8 +1,8 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from uuid import uuid4, UUID
-from typing import List
+from uuid import UUID
+from typing import List, Optional
 
 from .models import (
     ScrapeRequest,
@@ -16,7 +16,13 @@ from .models import (
     TeaserGenerationResponse,
     TeaserContent,
     ExportResponse,
+    Company,
+    UploadedFile,
+    Teaser,
 )
+from .database import Base, engine, get_db
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 
 tags_metadata = [
     {"name": "Scraping", "description": "Endpoints for scraping company information"},
@@ -41,10 +47,21 @@ app.add_middleware(
 )
 
 @app.get("/", tags=["Misc"])
-def health_check():
+async def health_check():
     """Health Check Endpoint -- returns status message."""
     return {"message": "Healthy"}
 
+@app.on_event("startup")
+async def on_startup():
+    """Create all database tables on startup if they don't exist."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Shutdown event placeholder."""
+    # SQLAlchemy async engine has no explicit global teardown
+    pass
 
 # PUBLIC_INTERFACE
 @app.post(
@@ -57,7 +74,7 @@ def health_check():
         400: {"description": "Invalid or unreachable URL."},
     }
 )
-def scrape_company(req: ScrapeRequest):
+async def scrape_company(req: ScrapeRequest):
     """
     Scrape the given company homepage and attempt to extract company details like name,
     industry, description, logo, headquarters, founded year, and contact info.
@@ -68,7 +85,8 @@ def scrape_company(req: ScrapeRequest):
     Returns:
         ScrapeResponse: Scraping status and extracted company info (if found).
     """
-    # Stub implementation for scaffolding
+    # TODO: Implement actual scraping logic here.
+    # For now, just return stub company with provided website
     test_company = CompanyInfo(
         name="Example Corp",
         website=req.url,
@@ -96,18 +114,21 @@ def scrape_company(req: ScrapeRequest):
     }
 )
 async def upload_files(
-    files: List[UploadFile] = File(..., description="One or more files to upload (PDF, DOCX, TXT, XLSX).")
+    files: List[UploadFile] = File(..., description="One or more files to upload (PDF, DOCX, TXT, XLSX)."),
+    company_id: Optional[UUID] = None,  # Optionally support associating with company
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Accept file uploads (PDF, DOCX, TXT, XLSX). Parses basic details and returns a list of the uploaded files.
 
     Args:
         files (List[UploadFile]): Uploaded files as multipart/form-data.
-        
+
     Returns:
         UploadResponse: List of all successfully uploaded and recognized files.
     """
     file_infos = []
+
     for file in files:
         content = await file.read(800)
         preview_text = None
@@ -115,6 +136,16 @@ async def upload_files(
             preview_text = content.decode("utf-8", errors="ignore")[:200]
         except Exception:
             preview_text = None
+
+        # Save metadata to DB
+        uploaded_file = UploadedFile(
+            company_id=company_id,
+            filename=file.filename,
+            content_type=file.content_type or "application/octet-stream",
+            size=len(content),
+            preview_text=preview_text
+        )
+        db.add(uploaded_file)
         file_infos.append(
             UploadedFileInfo(
                 filename=file.filename,
@@ -123,6 +154,7 @@ async def upload_files(
                 preview_text=preview_text
             )
         )
+    await db.commit()
     return UploadResponse(files=file_infos)
 
 # PUBLIC_INTERFACE
@@ -136,7 +168,10 @@ async def upload_files(
         422: {"description": "Validation error."},
     }
 )
-def confirm_company(req: ConfirmCompanyRequest):
+async def confirm_company(
+    req: ConfirmCompanyRequest,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Accepts edited/confirmed company profile from the user.
     Begins a teaser generation workflow, returning a session ID.
@@ -147,8 +182,25 @@ def confirm_company(req: ConfirmCompanyRequest):
     Returns:
         ConfirmCompanyResponse: Contains a session identifier.
     """
-    session_id = uuid4()
-    return ConfirmCompanyResponse(session_id=session_id)
+    # Persist company to DB
+    company_obj = Company(
+        name=req.company.name,
+        website=req.company.website,
+        industry=req.company.industry,
+        description=req.company.description,
+        headquarters=req.company.headquarters,
+        founded_year=req.company.founded_year,
+        email=req.company.email,
+        phone=req.company.phone,
+        employees=req.company.employees,
+        revenue=req.company.revenue,
+        logo_url=req.company.logo_url,
+    )
+    db.add(company_obj)
+    await db.commit()
+    await db.refresh(company_obj)
+    # Use database UUID as session_id
+    return ConfirmCompanyResponse(session_id=company_obj.id)
 
 # PUBLIC_INTERFACE
 @app.post(
@@ -161,7 +213,10 @@ def confirm_company(req: ConfirmCompanyRequest):
         400: {"description": "Invalid session or input."},
     }
 )
-def generate_teaser(req: TeaserGenerationRequest):
+async def generate_teaser(
+    req: TeaserGenerationRequest,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Generates an investment teaser draft based on confirmed company info and uploaded files.
     Uses AI models (stub for now).
@@ -172,18 +227,50 @@ def generate_teaser(req: TeaserGenerationRequest):
     Returns:
         TeaserGenerationResponse: The generated teaser draft/progress status.
     """
-    # Minimal stub response for scaffolding
-    teaser_id = uuid4()
-    company_stub = CompanyInfo(
-        name="Example Corp",
-        website="https://www.example.com"
+    # Find company by session_id (company_id)
+    result = await db.execute(select(Company).where(Company.id == req.session_id))
+    company_obj = result.scalar_one_or_none()
+    if not company_obj:
+        raise HTTPException(status_code=400, detail="Invalid session or missing company.")
+
+    # Generate teaser draft (stub AI integration for now)
+    title = f"Investment Teaser for {company_obj.name}"
+    content = (
+        f"Introducing {company_obj.name}! "
+        f"{company_obj.description or 'A dynamic company.'}"
     )
+
+    # Insert Teaser record
+    teaser_obj = Teaser(
+        company_id=company_obj.id,
+        title=title,
+        content=content,
+    )
+    db.add(teaser_obj)
+    await db.commit()
+    await db.refresh(teaser_obj)
+
+    company_data = CompanyInfo(
+        name=company_obj.name,
+        website=company_obj.website,
+        industry=company_obj.industry,
+        description=company_obj.description,
+        headquarters=company_obj.headquarters,
+        founded_year=company_obj.founded_year,
+        email=company_obj.email,
+        phone=company_obj.phone,
+        employees=company_obj.employees,
+        revenue=company_obj.revenue,
+        logo_url=company_obj.logo_url,
+    )
+
+    # Compose API response model
     teaser = TeaserContent(
-        teaser_id=teaser_id,
-        title="Sample Investment Teaser",
-        content="Introducing Example Corp, an innovative company revolutionizing software.",
-        company=company_stub,
-        generated_at="2024-07-01T00:00:00Z"
+        teaser_id=teaser_obj.id,
+        title=teaser_obj.title,
+        content=teaser_obj.content,
+        company=company_data,
+        generated_at=str(teaser_obj.generated_at),
     )
     return TeaserGenerationResponse(teaser=teaser, status="success")
 
@@ -198,7 +285,10 @@ def generate_teaser(req: TeaserGenerationRequest):
         404: {"description": "Teaser not found."},
     }
 )
-def export_teaser(teaser_id: UUID):
+async def export_teaser(
+    teaser_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Exports the generated teaser document (PDF or other formats).
 
@@ -208,13 +298,17 @@ def export_teaser(teaser_id: UUID):
     Returns:
         FileResponse: Downloadable teaser file.
     """
-    # This is a stub: in a real application, file paths and content are dynamic.
-    # Return OpenAPI doc annotation:
+    # Find the teaser in the DB
+    result = await db.execute(select(Teaser).where(Teaser.id == teaser_id))
+    teaser_obj = result.scalar_one_or_none()
+    if not teaser_obj:
+        raise HTTPException(status_code=404, detail="Teaser not found.")
+
+    # For now, send metadata response; PDF generation/export will be handled later
     resp_doc = ExportResponse(
         teaser_id=teaser_id,
-        filename="investment_teaser.pdf",
+        filename=f"investment_teaser_{teaser_id}.pdf",
         export_type="pdf",
         download_url=f"/api/export/{teaser_id}"
     )
-    # To comply with OpenAPI, send JSON doc when running in docs mode:
     return JSONResponse(status_code=200, content=resp_doc.model_dump())
